@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" style="background:#F7F4EE">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -125,6 +125,7 @@ body{background:var(--bg);font-family:'Inter',system-ui,sans-serif;color:var(--t
       <div class="brand-name">Nexus</div>
     </div>
     <div class="header-right">
+      <button class="status-pill off" style="border:none;cursor:pointer" onclick="if(confirm('Clear chat history?'))clearChat()" title="Clear chat">&#128465;</button>
       <div class="voice-state">
         <span class="vdot off" id="vdot"></span>
         <span id="voiceLabel">checking mic&hellip;</span>
@@ -135,6 +136,7 @@ body{background:var(--bg);font-family:'Inter',system-ui,sans-serif;color:var(--t
     <div class="status-pill off" id="pillLoc" onclick="requestLocation()">&#127759; Location</div>
     <div class="status-pill off" id="pillBat" id="pillBat">&#128267; Battery</div>
     <div class="status-pill off" id="pillCam" onclick="respond('open camera')">&#128247; Camera</div>
+    <div class="status-pill off" id="pillTimer" style="display:none"></div>
     <div class="status-pill off" id="pillShare">&#128279; Share</div>
   </div>
   <div class="thread" id="thread">
@@ -184,7 +186,7 @@ function pinSubmit(){
   if(pinEntry===CORRECT_PIN){
     document.getElementById('pinScreen').style.display='none';
     document.getElementById('app').classList.add('visible');
-    initVoice(); initBattery();
+    initVoice(); initBattery(); restoreChatLog(); restoreTimers();
   }else{
     document.getElementById('pinError').textContent='Wrong pin, try again';
     pinEntry='';updateDots();
@@ -234,6 +236,12 @@ function detectIntent(raw){
   const ytUrl=extractYTURL(raw);
   if(ytUrl){const vid=extractYTVideoId(ytUrl);if(vid)return{type:'yt_play',videoId:vid};}
 
+  // YouTube subscriptions / unsubscribe
+  if(/\b(?:my\s+)?subscriptions?\b/.test(low)&&/youtube|\byt\b/.test(low)&&!/unsubscribe/.test(low))
+    return{type:'yt_subscriptions'};
+  if(m=low.match(/^unsubscribe\s+(?:from\s+)?(.+?)(?:\s+on\s+(?:youtube|yt))?$/))
+    return{type:'yt_unsubscribe',channel:m[1].trim()};
+
   // YouTube search
   if(/\b(?:download|watch|play)\b/.test(low)&&/youtube|youtu\.be|\byt\b/.test(low))
     return{type:'app_search',app:'youtube',query:low.replace(/\b(?:download|watch|play|on youtube|on yt)\b/g,'').trim()};
@@ -281,6 +289,12 @@ function detectIntent(raw){
   if(/^(?:search\s+google|google\s+search|search\s+the\s+web|search\s+online)$/.test(low))return{type:'search_prompt'};
   if(m=low.match(/^(?:search|google|look\s*up|find)\s+(.+?)(?:\s+on\s+(?:google|the\s+web|internet))?$/))
     return{type:'app_search',app:'google',query:m[1]};
+
+  // GitHub search — handles "github X", "search github for X", "find X repos(itories) [on github]"
+  if(m=low.match(/^(?:github|gh)\s+(?:search\s+(?:for\s+)?)?(.+)$/))
+    return{type:'app_search',app:'github',query:m[1].trim()};
+  if(m=low.match(/^(?:search|find|look\s*up)\s+(?:for\s+)?(.+?)\s+repos?(?:itor(?:y|ies))?(?:\s+on\s+github)?$/))
+    return{type:'app_search',app:'github',query:m[1].trim()};
 
   // Open app + search
   if(m=low.match(/^open\s+(?:the\s+)?([a-z0-9 ]+?)\s+and\s+(?:search(?:\s+for)?|play|look\s*up|find)\s+(.+)$/))return{type:'app_search',app:m[1],query:m[2]};
@@ -386,32 +400,122 @@ async function initBattery(){
   }
 }
 
-function setTimer(durationStr, rowId){
-  // parse e.g. "5 minutes", "30 seconds", "1 hour"
+// ── TIMERS & ALARMS (persisted across reload, live countdown pill) ────────────
+const TIMERS_KEY='nexus_timers';
+let activeTimers=[]; // [{id,label,endTime,type:'timer'|'alarm'}]
+let timerTickHandle=null;
+
+function parseDurationMs(durationStr){
   let ms=0;
   const h=durationStr.match(/(\d+)\s*h/i); if(h) ms+=parseInt(h[1])*3600000;
   const min=durationStr.match(/(\d+)\s*m/i); if(min) ms+=parseInt(min[1])*60000;
   const sec=durationStr.match(/(\d+)\s*s/i); if(sec) ms+=parseInt(sec[1])*1000;
+  if(!ms){ // bare number with no unit, e.g. "5" → assume minutes
+    const bare=durationStr.match(/^\s*(\d+)\s*$/);
+    if(bare) ms=parseInt(bare[1])*60000;
+  }
+  return ms;
+}
+
+// Parses clock times like "5:30 pm", "17:30", "7am" into the next future Date.
+function parseClockTime(timeStr){
+  const s=timeStr.trim().toLowerCase();
+  let m=s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
+  if(!m)return null;
+  let hr=parseInt(m[1],10),min=m[2]?parseInt(m[2],10):0;const ap=m[3];
+  if(ap==='pm'&&hr<12)hr+=12;
+  if(ap==='am'&&hr===12)hr=0;
+  if(hr>23||min>59)return null;
+  const now=new Date();
+  const target=new Date(now.getFullYear(),now.getMonth(),now.getDate(),hr,min,0,0);
+  if(target<=now)target.setDate(target.getDate()+1); // next occurrence
+  return target;
+}
+
+function saveTimers(){try{localStorage.setItem(TIMERS_KEY,JSON.stringify(activeTimers));}catch(e){}}
+
+function notifyDone(label,kind){
+  if(typeof Notification!=='undefined'&&Notification.permission==='granted'){
+    new Notification('Nexus '+kind,{body:label+' is done!'});
+  }
+  if(navigator.vibrate)navigator.vibrate([300,100,300]);
+  addRow('bot','Your <strong>'+esc(label)+'</strong> '+kind.toLowerCase()+' is up! <span class="tag green">Done</span>');
+}
+
+function scheduleTimer(t){
+  const ms=t.endTime-Date.now();
+  if(ms<=0){notifyDone(t.label,t.type==='alarm'?'Alarm':'Timer');removeTimer(t.id);return;}
+  setTimeout(()=>{
+    if(activeTimers.find(x=>x.id===t.id)){notifyDone(t.label,t.type==='alarm'?'Alarm':'Timer');removeTimer(t.id);}
+  },ms);
+}
+
+function removeTimer(id){
+  activeTimers=activeTimers.filter(t=>t.id!==id);
+  saveTimers();
+  updateTimerPill();
+}
+
+function updateTimerPill(){
+  const pill=document.getElementById('pillTimer');
+  if(!activeTimers.length){pill.style.display='none';if(timerTickHandle){clearInterval(timerTickHandle);timerTickHandle=null;}return;}
+  pill.style.display='flex';pill.className='status-pill';
+  const tick=()=>{
+    // show the soonest-finishing active timer/alarm
+    const soonest=[...activeTimers].sort((a,b)=>a.endTime-b.endTime)[0];
+    if(!soonest)return;
+    const remain=Math.max(0,soonest.endTime-Date.now());
+    const hh=Math.floor(remain/3600000),mm=Math.floor((remain%3600000)/60000),ss=Math.floor((remain%60000)/1000);
+    const label=(soonest.type==='alarm'?'\u23F0 ':'\u23F1 ')+(hh?hh+':'+String(mm).padStart(2,'0'):mm+':'+String(ss).padStart(2,'0'));
+    pill.textContent=label+(activeTimers.length>1?' +'+(activeTimers.length-1):'');
+  };
+  tick();
+  if(!timerTickHandle)timerTickHandle=setInterval(tick,1000);
+  pill.onclick=()=>{
+    if(activeTimers.length&&confirm('Cancel '+(activeTimers.length>1?'all timers/alarms':activeTimers[0].label+'?'))){
+      activeTimers=[];saveTimers();updateTimerPill();
+    }
+  };
+}
+
+function restoreTimers(){
+  let saved=[];
+  try{saved=JSON.parse(localStorage.getItem(TIMERS_KEY)||'[]');}catch(e){saved=[];}
+  activeTimers=saved.filter(t=>t.endTime>Date.now()); // drop ones that already passed while app was closed
+  const missed=saved.filter(t=>t.endTime<=Date.now());
+  missed.forEach(t=>notifyDone(t.label,t.type==='alarm'?'Alarm':'Timer'));
+  saveTimers();
+  activeTimers.forEach(scheduleTimer);
+  updateTimerPill();
+}
+
+function setTimer(durationStr, rowId){
+  const ms=parseDurationMs(durationStr);
   if(!ms){setRow(rowId,"Couldn't understand that duration. Try '5 minutes' or '30 seconds'.<span class='tag err'>Error</span>");return;}
   const label=durationStr.trim();
-  setRow(rowId,'Timer set for <strong>'+esc(label)+'</strong>. I\'ll notify you when done!<span class="tag green">Timer</span>');
-  setTimeout(()=>{
-    if(Notification.permission==='granted'){new Notification('Nexus Timer','Timer for '+label+' is done!');}
-    alert('Timer done: '+label);
-    addRow('bot','Your <strong>'+esc(label)+'</strong> timer is up! <span class="tag green">Done</span>');
-  },ms);
-  // request notification permission
-  if(Notification.permission==='default') Notification.requestPermission();
+  const id='t'+Date.now();
+  const endTime=Date.now()+ms;
+  activeTimers.push({id,label,endTime,type:'timer'});saveTimers();scheduleTimer({id,label,endTime,type:'timer'});updateTimerPill();
+  setRow(rowId,'Timer set for <strong>'+esc(label)+'</strong>. I\'ll notify you when it\'s done — even if you reopen the app later.<span class="tag green">Timer</span>');
+  if(typeof Notification!=='undefined'&&Notification.permission==='default')Notification.requestPermission();
 }
 
 function setAlarm(timeStr, rowId){
-  const alarmUrl='intent://alarm#Intent;S.hours=0;S.message=Nexus+Alarm;scheme=android-app;end';
-  const clockUrl='https://www.google.com/search?q=set+alarm+for+'+encodeURIComponent(timeStr);
-  setRow(rowId,
-    'To set an alarm for <strong>'+esc(timeStr)+'</strong>, tap below (opens your clock app or Google):<br>'+
-    '<button class="action-btn" onclick="window.open(\''+clockUrl+'\',\'_blank\')">Set Alarm via Google</button>'+
-    '<span class="tag green">Alarm</span>'
-  );
+  const target=parseClockTime(timeStr);
+  if(!target){
+    const clockUrl='https://www.google.com/search?q=set+alarm+for+'+encodeURIComponent(timeStr);
+    setRow(rowId,
+      'Couldn\'t parse "'+esc(timeStr)+'" as a time (try e.g. "7:30 am"). You can set it via your clock app instead:<br>'+
+      '<button class="action-btn" onclick="window.open(\''+clockUrl+'\',\'_blank\')">Set Alarm via Google</button>'+
+      '<span class="tag err">Couldn\'t parse</span>'
+    );
+    return;
+  }
+  const id='a'+Date.now();
+  const label=target.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
+  activeTimers.push({id,label,endTime:target.getTime(),type:'alarm'});saveTimers();scheduleTimer({id,label,endTime:target.getTime(),type:'alarm'});updateTimerPill();
+  setRow(rowId,'Alarm set for <strong>'+esc(label)+'</strong>. I\'ll notify you here when it goes off.<span class="tag green">Alarm</span>');
+  if(typeof Notification!=='undefined'&&Notification.permission==='default')Notification.requestPermission();
 }
 
 function openCamera(){
@@ -541,15 +645,62 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>
 
 // ── CHAT UI ───────────────────────────────────────────────────────────────────
 let msgCount=0;
+const CHAT_KEY='nexus_chat_log';
+let chatLog=[]; // [{id,role,inner}] persisted to localStorage
+
+function saveChatLog(){
+  try{
+    // don't persist a dangling "typing…" bubble — it'll never resolve after reload
+    const clean=chatLog.filter(m=>!m.inner.includes('class="typing"'));
+    localStorage.setItem(CHAT_KEY,JSON.stringify(clean));
+  }catch(e){/* storage unavailable/full — fail silently */}
+}
+
+function restoreChatLog(){
+  let saved=[];
+  try{saved=JSON.parse(localStorage.getItem(CHAT_KEY)||'[]');}catch(e){saved=[];}
+  if(!saved.length)return;
+  const es=document.getElementById('emptyState');if(es)es.remove();
+  const thread=document.getElementById('thread');
+  saved.forEach(m=>{
+    const n=parseInt(m.id.replace('m',''),10);if(n>=msgCount)msgCount=n;
+    const row=document.createElement('div');row.className='row '+m.role;row.id=m.id;
+    const bub=document.createElement('div');bub.className='bubble';bub.innerHTML=m.inner;
+    row.appendChild(bub);thread.appendChild(row);
+    chatLog.push(m);
+  });
+  thread.scrollTop=thread.scrollHeight;
+}
+
+function clearChat(){
+  chatLog=[];msgCount=0;
+  try{localStorage.removeItem(CHAT_KEY);}catch(e){}
+  const thread=document.getElementById('thread');
+  thread.innerHTML='<div class="empty-state" id="emptyState"><h1>What do you need?</h1><p>Your AI assistant &mdash; talk, type, or tap a suggestion.</p><div class="suggestions">'+
+    '<div class="sugg" onclick="respond(\'Where am I?\')">Where am I?</div>'+
+    '<div class="sugg" onclick="respond(\'open spotify\')">open spotify</div>'+
+    '<div class="sugg" onclick="respond(\'set a timer for 10 minutes\')">set a timer</div>'+
+    '<div class="sugg" onclick="respond(\'take a photo\')">take a photo</div>'+
+    '<div class="sugg" onclick="respond(\'search google\')">search google</div>'+
+    '<div class="sugg" onclick="respond(\'call\')">make a call</div></div></div>';
+  conversationHistory=[];
+}
+
 function addRow(role,inner){
   const es=document.getElementById('emptyState');if(es)es.remove();
   const thread=document.getElementById('thread');
   const id='m'+(++msgCount);
   const row=document.createElement('div');row.className='row '+role;row.id=id;
   const bub=document.createElement('div');bub.className='bubble';bub.innerHTML=inner;
-  row.appendChild(bub);thread.appendChild(row);thread.scrollTop=thread.scrollHeight;return id;
+  row.appendChild(bub);thread.appendChild(row);thread.scrollTop=thread.scrollHeight;
+  chatLog.push({id,role,inner});saveChatLog();
+  return id;
 }
-function setRow(id,inner){const row=document.getElementById(id);if(row)row.querySelector('.bubble').innerHTML=inner;document.getElementById('thread').scrollTop=99999;}
+function setRow(id,inner){
+  const row=document.getElementById(id);if(row)row.querySelector('.bubble').innerHTML=inner;
+  document.getElementById('thread').scrollTop=99999;
+  const entry=chatLog.find(m=>m.id===id);if(entry){entry.inner=inner;saveChatLog();}
+}
 function typingRow(){return addRow('bot','<div class="typing"><span></span><span></span><span></span></div>');}
 
 // ── GEMINI AI ────────────────────────────────────────────────────────────────
@@ -579,6 +730,18 @@ async function respond(raw){
   const intent=detectIntent(raw);
 
   switch(intent.type){
+    case 'yt_subscriptions':
+      setTimeout(()=>{setRow(tid,'Opening your <strong>YouTube subscriptions</strong>.<br><span class="tag">YouTube</span>');setTimeout(()=>window.open('https://www.youtube.com/feed/channels','_blank'),700);},400);
+      break;
+    case 'yt_unsubscribe':
+      setTimeout(()=>{
+        const url='https://www.youtube.com/results?search_query='+encodeURIComponent(intent.channel);
+        setRow(tid,'I can\'t unsubscribe directly, but here\'s <strong>'+esc(intent.channel)+'</strong> — open the channel and tap "Subscribed" to remove it, or manage everything at once on your subscriptions page.<br>'+
+          '<button class="action-btn" onclick="window.open(\''+url+'\',\'_blank\')">Find channel</button>'+
+          '<button class="action-btn ghost" onclick="window.open(\'https://www.youtube.com/feed/channels\',\'_blank\')">Manage subscriptions</button>'+
+          '<span class="tag">YouTube</span>');
+      },400);
+      break;
     case 'yt_play':
       setTimeout(()=>setRow(tid,'<div class="yt-player"><iframe src="https://www.youtube.com/embed/'+intent.videoId+'?autoplay=1" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div><span class="tag">YouTube</span>'),400);
       break;
