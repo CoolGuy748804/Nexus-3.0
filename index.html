@@ -402,10 +402,12 @@ function detectIntent(raw){
   // Fullscreen
   if(/\b(?:full\s*screen|fullscreen)\b/.test(low))return{type:'fullscreen'};
 
-  // Web search - bare "search google" → ask what to search
+  // Web search — only trigger Google when explicitly asked for it; everything
+  // else (bare "search X" / "find X" / "look up X") falls through to the AI below.
   if(/^(?:search\s+google|google\s+search|search\s+the\s+web|search\s+online)$/.test(low))return{type:'search_prompt'};
-  if(m=low.match(/^(?:search|google|look\s*up|find)\s+(.+?)(?:\s+on\s+(?:google|the\s+web|internet))?$/))
-    return{type:'app_search',app:'google',query:m[1]};
+  if(m=low.match(/^google\s+(.+)$/))return{type:'app_search',app:'google',query:m[1]};
+  if(m=low.match(/^search\s+google\s+for\s+(.+)$/))return{type:'app_search',app:'google',query:m[1]};
+  if(m=low.match(/^(?:search|look\s*up|find)\s+(?:for\s+)?(.+?)\s+on\s+google$/))return{type:'app_search',app:'google',query:m[1]};
 
   // GitHub search — handles "github X", "search github for X", "find X repos(itories) [on github]"
   if(m=low.match(/^(?:github|gh)\s+(?:search\s+(?:for\s+)?)?(.+)$/))
