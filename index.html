@@ -90,6 +90,21 @@ body{background:var(--bg);font-family:'Inter',system-ui,sans-serif;color:var(--t
 .map-frame{margin-top:8px;border-radius:10px;overflow:hidden;width:100%;height:220px;border:none;display:block;}
 .action-btn{display:inline-block;margin-top:8px;margin-right:6px;padding:8px 14px;border-radius:999px;background:var(--accent);color:#fff;font-size:13px;font-weight:500;cursor:pointer;border:none;font-family:'Inter',sans-serif;}
 .action-btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent);}
+#historyScreen{position:fixed;inset:0;background:var(--bg);z-index:998;display:none;flex-direction:column;}
+#historyScreen.visible{display:flex;}
+.history-header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--line);flex-shrink:0;}
+.history-header h2{font-family:'Source Serif 4',serif;font-size:18px;font-weight:600;}
+.history-close{width:32px;height:32px;border-radius:50%;border:none;background:var(--surface-2);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text);font-size:17px;line-height:1;}
+.history-new{margin:12px 16px 4px;padding:11px;border-radius:12px;background:var(--accent);color:#fff;border:none;font-family:'Inter',sans-serif;font-size:14px;font-weight:500;cursor:pointer;}
+.history-list{flex:1;overflow-y:auto;padding:10px 12px 20px;}
+.history-item{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:12px;margin-bottom:8px;background:var(--surface);border:1px solid var(--line);cursor:pointer;}
+.history-item.active{border-color:var(--accent);}
+.history-item-body{flex:1;min-width:0;}
+.history-item-title{font-size:14px;font-weight:500;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.history-item-meta{font-size:12px;color:var(--text-dim);margin-top:2px;}
+.history-item-del{width:28px;height:28px;border-radius:50%;border:none;background:transparent;color:var(--text-dim);flex-shrink:0;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;}
+.history-item-del:active{background:var(--err-soft);color:var(--err);}
+.history-empty{text-align:center;color:var(--text-dim);font-size:14px;margin-top:60px;padding:0 24px;}
 </style>
 </head>
 <body>
@@ -126,8 +141,10 @@ body{background:var(--bg);font-family:'Inter',system-ui,sans-serif;color:var(--t
       <div class="brand-name">Nexus</div>
     </div>
     <div class="header-right">
+      <button class="status-pill off" style="border:none;cursor:pointer" onclick="toggleTTS()" title="Toggle spoken responses" id="ttsBtn">&#128264;</button>
       <button class="status-pill off" style="border:none;cursor:pointer" onclick="toggleTheme()" title="Toggle dark/light mode" id="themeBtn">&#127768;</button>
-      <button class="status-pill off" style="border:none;cursor:pointer" onclick="if(confirm('Clear chat history?'))clearChat()" title="Clear chat">&#128465;</button>
+      <button class="status-pill off" style="border:none;cursor:pointer" onclick="openHistory()" title="All chats">&#128172;</button>
+      <button class="status-pill off" style="border:none;cursor:pointer" onclick="if(confirm('Start a new chat? This one stays saved in your chat history.'))clearChat()" title="New chat">&#10133;</button>
       <div class="voice-state">
         <span class="vdot off" id="vdot"></span>
         <span id="voiceLabel">checking mic&hellip;</span>
@@ -172,6 +189,15 @@ body{background:var(--bg);font-family:'Inter',system-ui,sans-serif;color:var(--t
   </div>
 </div>
 
+<div id="historyScreen">
+  <div class="history-header">
+    <h2>Chats</h2>
+    <button class="history-close" onclick="closeHistory()" aria-label="Close">&times;</button>
+  </div>
+  <button class="history-new" onclick="clearChat();closeHistory();">&#10133; New chat</button>
+  <div class="history-list" id="historyList"></div>
+</div>
+
 <!-- hidden file input for camera/file -->
 <input type="file" id="fileInput" accept="image/*" capture="environment" style="display:none" onchange="handleFileCapture(event)">
 
@@ -203,6 +229,70 @@ function toggleTheme(){
   const theme = saved || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
   applyTheme(theme);
 })();
+
+// ── HAPTICS ──────────────────────────────────────────────────────────────────
+// Short, subtle buzzes on system actions (button taps, toggles, completions).
+// Silently no-ops on devices/browsers without the Vibration API.
+function tick(ms){
+  if('vibrate' in navigator){try{navigator.vibrate(ms||12);}catch(e){}}
+}
+
+// ── TEXT-TO-SPEECH ───────────────────────────────────────────────────────────
+const TTS_KEY='nexus_tts';
+let ttsEnabled=false;
+let ttsVoice=null;
+function loadVoice(){
+  if(!('speechSynthesis' in window))return;
+  const voices=speechSynthesis.getVoices();
+  ttsVoice=voices.find(v=>/en/i.test(v.lang))||voices[0]||null;
+}
+if('speechSynthesis' in window){
+  loadVoice();
+  speechSynthesis.onvoiceschanged=loadVoice;
+}
+function applyTTSButton(){
+  const btn=document.getElementById('ttsBtn');
+  if(!btn)return;
+  btn.innerHTML = ttsEnabled ? '&#128266;' : '&#128264;';
+  btn.classList.toggle('off', !ttsEnabled);
+}
+function toggleTTS(){
+  ttsEnabled=!ttsEnabled;
+  try{localStorage.setItem(TTS_KEY, ttsEnabled?'1':'0');}catch(e){}
+  applyTTSButton();
+  tick(12);
+  if(!ttsEnabled && 'speechSynthesis' in window) speechSynthesis.cancel();
+  else if(ttsEnabled) speak('Voice responses on.');
+}
+(function initTTS(){
+  let saved=null;
+  try{saved=localStorage.getItem(TTS_KEY);}catch(e){}
+  ttsEnabled = saved==='1';
+  applyTTSButton();
+})();
+// Strips markdown/HTML so raw AI text reads naturally aloud.
+function cleanForSpeech(text){
+  return String(text)
+    .replace(/```[\s\S]*?```/g,'code block omitted')
+    .replace(/`([^`]+)`/g,'$1')
+    .replace(/\*\*([^*]+)\*\*/g,'$1')
+    .replace(/\*([^*]+)\*/g,'$1')
+    .replace(/#{1,6}\s*/g,'')
+    .replace(/<[^>]+>/g,'')
+    .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g,'$1')
+    .trim();
+}
+function speak(text){
+  if(!ttsEnabled || !('speechSynthesis' in window))return;
+  const clean=cleanForSpeech(text);
+  if(!clean)return;
+  speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance(clean);
+  if(ttsVoice)u.voice=ttsVoice;
+  u.rate=1;u.pitch=1;
+  speechSynthesis.speak(u);
+}
 
 // ── PIN ──────────────────────────────────────────────────────────────────────
 let pinEntry = '';
@@ -670,26 +760,51 @@ function mdToHtml(md){
 }
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
-// ── CHAT UI ───────────────────────────────────────────────────────────────────
+// ── CHAT UI / SESSION HISTORY ───────────────────────────────────────────────
 let msgCount=0;
-const CHAT_KEY='nexus_chat_log';
-let chatLog=[]; // [{id,role,inner}] persisted to localStorage
+const CHAT_KEY='nexus_chat_log';           // legacy single-thread key, migrated on first load
+const SESSIONS_KEY='nexus_sessions';       // [{id,title,updatedAt,messages:[{id,role,inner}]}]
+const CURRENT_SESSION_KEY='nexus_current_session';
+let chatLog=[];          // messages of the active session
+let currentSessionId=null;
+const EMPTY_STATE_HTML='<div class="empty-state" id="emptyState"><h1>What do you need?</h1><p>Your AI assistant &mdash; talk, type, or tap a suggestion.</p><div class="suggestions">'+
+    '<div class="sugg" onclick="respond(\'Where am I?\')">Where am I?</div>'+
+    '<div class="sugg" onclick="respond(\'open spotify\')">open spotify</div>'+
+    '<div class="sugg" onclick="respond(\'set a timer for 10 minutes\')">set a timer</div>'+
+    '<div class="sugg" onclick="respond(\'take a photo\')">take a photo</div>'+
+    '<div class="sugg" onclick="respond(\'search google\')">search google</div>'+
+    '<div class="sugg" onclick="respond(\'call\')">make a call</div></div></div>';
+
+function newSessionId(){return 's'+Date.now().toString(36)+Math.random().toString(36).slice(2,7);}
+function stripHtml(html){return String(html).replace(/<[^>]+>/g,' ').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/\s+/g,' ').trim();}
+function sessionTitle(messages){
+  const firstUser=messages.find(m=>m.role==='user');
+  if(!firstUser)return 'New chat';
+  const text=stripHtml(firstUser.inner);
+  return text ? (text.length>42?text.slice(0,42)+'…':text) : 'New chat';
+}
+function loadSessions(){try{return JSON.parse(localStorage.getItem(SESSIONS_KEY)||'[]');}catch(e){return [];}}
+function saveSessions(sessions){try{localStorage.setItem(SESSIONS_KEY,JSON.stringify(sessions));}catch(e){/* storage unavailable/full — fail silently */}}
 
 function saveChatLog(){
   try{
     // don't persist a dangling "typing…" bubble — it'll never resolve after reload
     const clean=chatLog.filter(m=>!m.inner.includes('class="typing"'));
-    localStorage.setItem(CHAT_KEY,JSON.stringify(clean));
+    if(!clean.length)return;
+    const sessions=loadSessions();
+    const idx=sessions.findIndex(s=>s.id===currentSessionId);
+    const data={id:currentSessionId,title:sessionTitle(clean),updatedAt:Date.now(),messages:clean};
+    if(idx>=0)sessions[idx]=data;else sessions.unshift(data);
+    saveSessions(sessions);
+    try{localStorage.setItem(CURRENT_SESSION_KEY,currentSessionId);}catch(e){}
   }catch(e){/* storage unavailable/full — fail silently */}
 }
 
-function restoreChatLog(){
-  let saved=[];
-  try{saved=JSON.parse(localStorage.getItem(CHAT_KEY)||'[]');}catch(e){saved=[];}
-  if(!saved.length)return;
-  const es=document.getElementById('emptyState');if(es)es.remove();
+function renderMessages(messages){
   const thread=document.getElementById('thread');
-  saved.forEach(m=>{
+  thread.innerHTML='';
+  if(!messages.length){thread.innerHTML=EMPTY_STATE_HTML;return;}
+  messages.forEach(m=>{
     const n=parseInt(m.id.replace('m',''),10);if(n>=msgCount)msgCount=n;
     const row=document.createElement('div');row.className='row '+m.role;row.id=m.id;
     const bub=document.createElement('div');bub.className='bubble';bub.innerHTML=m.inner;
@@ -699,19 +814,106 @@ function restoreChatLog(){
   thread.scrollTop=thread.scrollHeight;
 }
 
+// rebuild the Gemini-format context array from a session's saved bubbles,
+// so reopening an old chat lets the AI remember what was said in it.
+function rebuildConversationHistory(messages){
+  conversationHistory=messages
+    .filter(m=>m.role==='user'||m.role==='bot')
+    .map(m=>({role:m.role==='bot'?'model':'user',parts:[{text:stripHtml(m.inner)}]}))
+    .filter(m=>m.parts[0].text);
+}
+
+function restoreChatLog(){
+  let sid=null;
+  try{sid=localStorage.getItem(CURRENT_SESSION_KEY);}catch(e){}
+  let sessions=loadSessions();
+  let session=sessions.find(s=>s.id===sid);
+  if(!session){
+    // migrate the old single-thread log (pre-history-panel versions) into a session, once
+    let legacy=[];
+    try{legacy=JSON.parse(localStorage.getItem(CHAT_KEY)||'[]');}catch(e){legacy=[];}
+    if(legacy.length){
+      session={id:newSessionId(),title:sessionTitle(legacy),updatedAt:Date.now(),messages:legacy};
+      sessions.unshift(session);saveSessions(sessions);
+      try{localStorage.removeItem(CHAT_KEY);}catch(e){}
+    }else{
+      session={id:newSessionId(),title:'New chat',updatedAt:Date.now(),messages:[]};
+    }
+  }
+  currentSessionId=session.id;
+  try{localStorage.setItem(CURRENT_SESSION_KEY,currentSessionId);}catch(e){}
+  if(!session.messages.length)return;
+  const es=document.getElementById('emptyState');if(es)es.remove();
+  renderMessages(session.messages);
+  rebuildConversationHistory(session.messages);
+}
+
 function clearChat(){
+  currentSessionId=newSessionId();
+  try{localStorage.setItem(CURRENT_SESSION_KEY,currentSessionId);}catch(e){}
   chatLog=[];msgCount=0;
-  try{localStorage.removeItem(CHAT_KEY);}catch(e){}
-  const thread=document.getElementById('thread');
-  thread.innerHTML='<div class="empty-state" id="emptyState"><h1>What do you need?</h1><p>Your AI assistant &mdash; talk, type, or tap a suggestion.</p><div class="suggestions">'+
-    '<div class="sugg" onclick="respond(\'Where am I?\')">Where am I?</div>'+
-    '<div class="sugg" onclick="respond(\'open spotify\')">open spotify</div>'+
-    '<div class="sugg" onclick="respond(\'set a timer for 10 minutes\')">set a timer</div>'+
-    '<div class="sugg" onclick="respond(\'take a photo\')">take a photo</div>'+
-    '<div class="sugg" onclick="respond(\'search google\')">search google</div>'+
-    '<div class="sugg" onclick="respond(\'call\')">make a call</div></div></div>';
+  document.getElementById('thread').innerHTML=EMPTY_STATE_HTML;
   conversationHistory=[];
 }
+
+function openSession(id){
+  if(id===currentSessionId){closeHistory();return;}
+  const sessions=loadSessions();
+  const session=sessions.find(s=>s.id===id);
+  if(!session)return;
+  currentSessionId=id;
+  try{localStorage.setItem(CURRENT_SESSION_KEY,id);}catch(e){}
+  chatLog=[];msgCount=0;
+  renderMessages(session.messages);
+  rebuildConversationHistory(session.messages);
+  closeHistory();
+  tick(10);
+}
+
+function deleteSession(id,evt){
+  if(evt)evt.stopPropagation();
+  if(!confirm('Delete this chat? This can\'t be undone.'))return;
+  saveSessions(loadSessions().filter(s=>s.id!==id));
+  if(id===currentSessionId)clearChat();
+  renderHistoryList();
+  tick(12);
+}
+
+function timeAgo(ts){
+  const s=Math.floor((Date.now()-ts)/1000);
+  if(s<60)return 'just now';
+  const m=Math.floor(s/60);if(m<60)return m+'m ago';
+  const h=Math.floor(m/60);if(h<24)return h+'h ago';
+  const d=Math.floor(h/24);if(d<7)return d+'d ago';
+  return new Date(ts).toLocaleDateString();
+}
+
+function renderHistoryList(){
+  const list=document.getElementById('historyList');
+  const sessions=loadSessions().filter(s=>s.messages&&s.messages.length).sort((a,b)=>b.updatedAt-a.updatedAt);
+  if(!sessions.length){
+    list.innerHTML='<div class="history-empty">No saved chats yet. Start talking to Nexus and it\'ll show up here.</div>';
+    return;
+  }
+  list.innerHTML=sessions.map(s=>{
+    const count=s.messages.length;
+    return '<div class="history-item'+(s.id===currentSessionId?' active':'')+'" onclick="openSession(\''+s.id+'\')">'+
+      '<div class="history-item-body">'+
+        '<div class="history-item-title">'+esc(s.title)+'</div>'+
+        '<div class="history-item-meta">'+timeAgo(s.updatedAt)+' &middot; '+count+' message'+(count===1?'':'s')+'</div>'+
+      '</div>'+
+      '<button class="history-item-del" onclick="deleteSession(\''+s.id+'\',event)" aria-label="Delete chat">&#128465;</button>'+
+    '</div>';
+  }).join('');
+}
+
+function openHistory(){
+  saveChatLog(); // make sure the in-progress chat shows up if it already has messages
+  renderHistoryList();
+  document.getElementById('historyScreen').classList.add('visible');
+  tick(10);
+}
+function closeHistory(){document.getElementById('historyScreen').classList.remove('visible');}
 
 function addRow(role,inner){
   const es=document.getElementById('emptyState');if(es)es.remove();
@@ -743,6 +945,7 @@ async function handleAI(question,label,rowId){
     const text=data?.candidates?.[0]?.content?.parts?.[0]?.text||"Sorry, couldn't get a response.";
     conversationHistory.push({role:'model',parts:[{text:text}]});
     setRow(rowId,'<div class="ai-body">'+mdToHtml(text)+'</div><span class="tag">'+label+'</span>');
+    speak(text);
   }catch(e){
     conversationHistory.pop();
     setRow(rowId,"Couldn't reach AI &mdash; check your connection.<br><span class=\"tag err\">Error</span>");
@@ -752,6 +955,8 @@ async function handleAI(question,label,rowId){
 // ── RESPOND ───────────────────────────────────────────────────────────────────
 async function respond(raw){
   if(!raw.trim())return;
+  if('speechSynthesis' in window) speechSynthesis.cancel();
+  tick(10);
   addRow('user',esc(raw));
   const tid=typingRow();
   const intent=detectIntent(raw);
@@ -847,7 +1052,7 @@ async function respond(raw){
 const textInput=document.getElementById('textInput');
 const sendBtn=document.getElementById('sendBtn');
 textInput.addEventListener('input',()=>{sendBtn.disabled=!textInput.value.trim();});
-function handleSend(){const v=textInput.value.trim();if(!v)return;respond(v);textInput.value='';sendBtn.disabled=true;}
+function handleSend(){const v=textInput.value.trim();if(!v)return;tick(10);respond(v);textInput.value='';sendBtn.disabled=true;}
 
 // ── VOICE ─────────────────────────────────────────────────────────────────────
 let recognition=null,listening=false;
@@ -864,7 +1069,7 @@ function initVoice(){
   recognition.onend=()=>{listening=false;document.getElementById('micBtn').classList.remove('listening');document.getElementById('micIcon').setAttribute('fill','#928C7F');vdot.classList.add('off');vlabel.textContent='voice ready';};
   vlabel.textContent='voice ready';
 }
-function toggleMic(){if(!recognition)return;if(listening)recognition.stop();else{try{recognition.start();}catch(e){}}}
+function toggleMic(){if(!recognition)return;tick(10);if(listening)recognition.stop();else{try{recognition.start();}catch(e){}}}
 
 // ── PWA INSTALL (Android/Chrome) ─────────────────────────────────────────────
 // Registers sw.js if it's hosted alongside this file. Harmless no-op (silent
