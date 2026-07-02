@@ -48,9 +48,19 @@ body{background:var(--bg);font-family:'Inter',system-ui,sans-serif;color:var(--t
 .row{display:flex;}
 .row.user{justify-content:flex-end;}
 .row.bot{justify-content:flex-start;}
-.bubble{max-width:82%;padding:11px 14px;border-radius:16px;font-size:14.5px;line-height:1.5;}
+.bubble{max-width:82%;padding:11px 14px;border-radius:16px;font-size:14.5px;line-height:1.5;position:relative;}
 .row.user .bubble{background:var(--bubble-user);color:var(--on-accent, #fff);border-bottom-right-radius:4px;}
 .row.bot .bubble{background:var(--bubble-bot);border:1px solid var(--line);border-bottom-left-radius:4px;}
+.pin-btn{position:absolute;top:-9px;right:-9px;width:22px;height:22px;border-radius:50%;border:1px solid var(--line);background:var(--surface);color:var(--text-dim);font-size:11px;display:flex;align-items:center;justify-content:center;cursor:pointer;opacity:.5;padding:0;line-height:1;}
+.pin-btn.pinned{opacity:1;background:var(--accent);color:#fff;border-color:var(--accent);}
+.followups{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px;}
+.followup-chip{font-size:12px;padding:6px 11px;border-radius:999px;background:var(--surface-2);color:var(--text);border:1px solid var(--line);cursor:pointer;}
+.history-item-export{width:28px;height:28px;border-radius:50%;border:none;background:transparent;color:var(--text-dim);flex-shrink:0;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;}
+.history-item-export:active{background:var(--accent-soft);color:var(--accent);}
+.history-tabs{display:flex;gap:8px;padding:0 16px 4px;}
+.history-tab{flex:1;padding:8px;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:var(--text-dim);font-size:13px;font-weight:500;cursor:pointer;}
+.history-tab.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+.pin-item-role{font-size:11px;color:var(--accent);font-weight:600;margin-bottom:1px;}
 .tag{display:inline-block;margin-top:6px;font-size:11px;background:var(--accent-soft);color:var(--accent);padding:2px 8px;border-radius:999px;font-weight:500;}
 .tag.err{background:var(--err-soft);color:var(--err);}
 .tag.green{background:var(--good-soft);color:var(--good);}
@@ -195,6 +205,10 @@ body{background:var(--bg);font-family:'Inter',system-ui,sans-serif;color:var(--t
     <button class="history-close" onclick="closeHistory()" aria-label="Close">&times;</button>
   </div>
   <button class="history-new" onclick="clearChat();closeHistory();">&#10133; New chat</button>
+  <div class="history-tabs">
+    <button class="history-tab active" id="tabAll" onclick="switchHistoryTab('all')">All Chats</button>
+    <button class="history-tab" id="tabPinned" onclick="switchHistoryTab('pinned')">Pinned</button>
+  </div>
   <div class="history-list" id="historyList"></div>
 </div>
 
@@ -371,9 +385,29 @@ function detectIntent(raw){
   // Email
   if(m=low.match(/^(?:email|mail)\s+(.+)$/))return{type:'email',target:m[1]};
 
+  // Memory — facts that persist across every future chat, not just this session
+  if(m=low.match(/^what do you remember(?:\s+about\s+me)?\??$/))return{type:'recall_memory'};
+  if(m=low.match(/^forget\s+(?:that\s+)?(.+)$/))return{type:'forget',fact:m[1]};
+  if(m=low.match(/^remember\s+(?:that\s+)?(.+)$/))return{type:'remember',fact:m[1]};
+
   // Timer / Alarm
   if(m=low.match(/^set\s+(?:a\s+)?timer\s+(?:for\s+)?(.+)$/))return{type:'timer',duration:m[1]};
   if(m=low.match(/^(?:set\s+(?:an?\s+)?)?alarm\s+(?:for\s+|at\s+)?(.+)$/))return{type:'alarm',time:m[1]};
+
+  // Reminders — like alarms, but with a note and a flexible date, not just a clock time
+  if(m=low.match(/^(?:remind me to|set a reminder to|set a reminder for)\s+(.+?)(?:\s+(tomorrow.*|today.*|on\s+\w+.*|at\s+\d.*|in\s+\d+.*))$/))
+    return{type:'reminder',note:m[1].trim(),when:m[2].trim()};
+  if(m=low.match(/^(?:remind me to|set a reminder to|set a reminder for)\s+(.+)$/))
+    return{type:'reminder',note:m[1].trim(),when:null};
+
+  // Weather
+  if(m=low.match(/^(?:what'?s the |what is the |check )?weather\s+(?:in|for|at)\s+(.+)$/))return{type:'weather',place:m[1].trim()};
+  if(m=low.match(/^how'?s the weather(?:\s+in\s+(.+))?\??$/))return{type:'weather',place:m[1]?m[1].trim():null};
+  if(/^(?:what'?s the |what is the )?weather(?:\s+(?:today|now|right now|outside))?\??$/.test(low))return{type:'weather',place:null};
+
+  // Image generation
+  if(m=low.match(/^(?:generate|create|draw|make|imagine)\s+(?:an?\s+)?(?:image|picture|photo|drawing|illustration)\s+(?:of\s+)?(.+)$/))
+    return{type:'image_gen',prompt:m[1].trim()};
 
   // Location
   if(/\b(?:where am i|my location|my address|current location|find me|what'?s? my location)\b/.test(low))return{type:'location'};
@@ -521,8 +555,9 @@ async function initBattery(){
 
 // ── TIMERS & ALARMS (persisted across reload, live countdown pill) ────────────
 const TIMERS_KEY='nexus_timers';
-let activeTimers=[]; // [{id,label,endTime,type:'timer'|'alarm'}]
+let activeTimers=[]; // [{id,label,endTime,type:'timer'|'alarm'|'reminder'}]
 let timerTickHandle=null;
+const WEEKDAYS=['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
 
 function parseDurationMs(durationStr){
   let ms=0;
@@ -551,21 +586,58 @@ function parseClockTime(timeStr){
   return target;
 }
 
+// Parses reminder phrasing: "tomorrow at 3pm", "in 20 minutes", "on friday", "at 5pm", "today".
+// Falls back to 9am on the target day when no clock time is given.
+function parseReminderWhen(str){
+  const s=str.trim().toLowerCase();
+  const now=new Date();
+  let m=s.match(/^in\s+(\d+)\s*(day|days|hour|hours|hr|hrs|h|minute|minutes|min|mins|m)$/);
+  if(m){
+    const n=parseInt(m[1],10),unit=m[2];
+    const ms=/^d/.test(unit)?n*86400000:/^h/.test(unit)?n*3600000:n*60000;
+    return new Date(now.getTime()+ms);
+  }
+  let hr=null,min=0;
+  const tm=s.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/);
+  if(tm){
+    hr=parseInt(tm[1],10);min=tm[2]?parseInt(tm[2],10):0;
+    if(tm[3]==='pm'&&hr<12)hr+=12;
+    if(tm[3]==='am'&&hr===12)hr=0;
+  }
+  let dayOffset=null;
+  if(/\btomorrow\b/.test(s))dayOffset=1;
+  else if(/\btoday\b/.test(s))dayOffset=0;
+  else{
+    for(let i=0;i<WEEKDAYS.length;i++){
+      if(s.indexOf(WEEKDAYS[i])!==-1){let diff=(i-now.getDay()+7)%7;if(diff===0)diff=7;dayOffset=diff;break;}
+    }
+  }
+  if(dayOffset===null&&hr===null)return parseClockTime(str); // bare time like alarm
+  const base=new Date(now.getFullYear(),now.getMonth(),now.getDate());
+  if(dayOffset!==null)base.setDate(base.getDate()+dayOffset);
+  base.setHours(hr!==null?hr:9,hr!==null?min:0,0,0);
+  if(dayOffset===null&&base<=now)base.setDate(base.getDate()+1);
+  return base;
+}
+
 function saveTimers(){try{localStorage.setItem(TIMERS_KEY,JSON.stringify(activeTimers));}catch(e){}}
+function kindLabel(type){return type==='alarm'?'Alarm':type==='reminder'?'Reminder':'Timer';}
 
 function notifyDone(label,kind){
   if(typeof Notification!=='undefined'&&Notification.permission==='granted'){
-    new Notification('Nexus '+kind,{body:label+' is done!'});
+    new Notification('Nexus '+kind,{body:kind==='Reminder'?label:label+' is done!'});
   }
   if(navigator.vibrate)navigator.vibrate([300,100,300]);
-  addRow('bot','Your <strong>'+esc(label)+'</strong> '+kind.toLowerCase()+' is up! <span class="tag green">Done</span>');
+  addRow('bot',kind==='Reminder'
+    ?'Reminder: <strong>'+esc(label)+'</strong> <span class="tag green">Reminder</span>'
+    :'Your <strong>'+esc(label)+'</strong> '+kind.toLowerCase()+' is up! <span class="tag green">Done</span>');
 }
 
 function scheduleTimer(t){
   const ms=t.endTime-Date.now();
-  if(ms<=0){notifyDone(t.label,t.type==='alarm'?'Alarm':'Timer');removeTimer(t.id);return;}
+  if(ms<=0){notifyDone(t.label,kindLabel(t.type));removeTimer(t.id);return;}
   setTimeout(()=>{
-    if(activeTimers.find(x=>x.id===t.id)){notifyDone(t.label,t.type==='alarm'?'Alarm':'Timer');removeTimer(t.id);}
+    if(activeTimers.find(x=>x.id===t.id)){notifyDone(t.label,kindLabel(t.type));removeTimer(t.id);}
   },ms);
 }
 
@@ -580,12 +652,13 @@ function updateTimerPill(){
   if(!activeTimers.length){pill.style.display='none';if(timerTickHandle){clearInterval(timerTickHandle);timerTickHandle=null;}return;}
   pill.style.display='flex';pill.className='status-pill';
   const tick=()=>{
-    // show the soonest-finishing active timer/alarm
+    // show the soonest-finishing active timer/alarm/reminder
     const soonest=[...activeTimers].sort((a,b)=>a.endTime-b.endTime)[0];
     if(!soonest)return;
     const remain=Math.max(0,soonest.endTime-Date.now());
     const hh=Math.floor(remain/3600000),mm=Math.floor((remain%3600000)/60000),ss=Math.floor((remain%60000)/1000);
-    const label=(soonest.type==='alarm'?'\u23F0 ':'\u23F1 ')+(hh?hh+':'+String(mm).padStart(2,'0'):mm+':'+String(ss).padStart(2,'0'));
+    const icon=soonest.type==='alarm'?'\u23F0 ':soonest.type==='reminder'?'\uD83D\uDD14 ':'\u23F1 ';
+    const label=icon+(hh?hh+':'+String(mm).padStart(2,'0'):mm+':'+String(ss).padStart(2,'0'));
     pill.textContent=label+(activeTimers.length>1?' +'+(activeTimers.length-1):'');
   };
   tick();
@@ -602,10 +675,23 @@ function restoreTimers(){
   try{saved=JSON.parse(localStorage.getItem(TIMERS_KEY)||'[]');}catch(e){saved=[];}
   activeTimers=saved.filter(t=>t.endTime>Date.now()); // drop ones that already passed while app was closed
   const missed=saved.filter(t=>t.endTime<=Date.now());
-  missed.forEach(t=>notifyDone(t.label,t.type==='alarm'?'Alarm':'Timer'));
+  missed.forEach(t=>notifyDone(t.label,kindLabel(t.type)));
   saveTimers();
   activeTimers.forEach(scheduleTimer);
   updateTimerPill();
+}
+
+function setReminder(note,whenStr,rowId){
+  const target=whenStr?parseReminderWhen(whenStr):null;
+  if(!target){
+    setRow(rowId,'When should I remind you to <strong>'+esc(note)+'</strong>? Try "tomorrow at 3pm", "in 20 minutes", or "on friday".<span class="tag">Reminder</span>');
+    return;
+  }
+  const id='r'+Date.now();
+  activeTimers.push({id,label:note,endTime:target.getTime(),type:'reminder'});saveTimers();scheduleTimer({id,label:note,endTime:target.getTime(),type:'reminder'});updateTimerPill();
+  const when=target.toLocaleString([],{weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+  setRow(rowId,'Got it — I\'ll remind you to <strong>'+esc(note)+'</strong> on '+esc(when)+'. This stays saved even if you close the app, as long as you reopen it after that time.<span class="tag green">Reminder</span>');
+  if(typeof Notification!=='undefined'&&Notification.permission==='default')Notification.requestPermission();
 }
 
 function setTimer(durationStr, rowId){
@@ -778,7 +864,12 @@ const EMPTY_STATE_HTML='<div class="empty-state" id="emptyState"><h1>What do you
     '<div class="sugg" onclick="respond(\'call\')">make a call</div></div></div>';
 
 function newSessionId(){return 's'+Date.now().toString(36)+Math.random().toString(36).slice(2,7);}
-function stripHtml(html){return String(html).replace(/<[^>]+>/g,' ').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/\s+/g,' ').trim();}
+function stripHtml(html){
+  const tmp=document.createElement('div');
+  tmp.innerHTML=String(html);
+  tmp.querySelectorAll('.followups').forEach(e=>e.remove());
+  return (tmp.textContent||'').replace(/\s+/g,' ').trim();
+}
 function sessionTitle(messages){
   const firstUser=messages.find(m=>m.role==='user');
   if(!firstUser)return 'New chat';
@@ -802,15 +893,42 @@ function saveChatLog(){
   }catch(e){/* storage unavailable/full — fail silently */}
 }
 
+// builds one message row: a bubble holding the content plus a pin toggle button.
+// content lives in its own child div so setRow() can replace it without
+// clobbering the pin button.
+function renderRowEl(m){
+  const thread=document.getElementById('thread');
+  const row=document.createElement('div');row.className='row '+m.role;row.id=m.id;
+  const bub=document.createElement('div');bub.className='bubble';
+  const content=document.createElement('div');content.className='bubble-content';content.innerHTML=m.inner;
+  const pinBtn=document.createElement('button');
+  pinBtn.className='pin-btn'+(m.pinned?' pinned':'');
+  pinBtn.innerHTML='&#128204;';
+  pinBtn.setAttribute('aria-label','Pin message');
+  pinBtn.onclick=function(e){e.stopPropagation();togglePin(m.id);};
+  bub.appendChild(content);bub.appendChild(pinBtn);
+  row.appendChild(bub);thread.appendChild(row);
+  return row;
+}
+
+function togglePin(id){
+  const entry=chatLog.find(m=>m.id===id);
+  if(!entry)return;
+  entry.pinned=!entry.pinned;
+  saveChatLog();
+  const row=document.getElementById(id);
+  const btn=row&&row.querySelector('.pin-btn');
+  if(btn)btn.classList.toggle('pinned',entry.pinned);
+  tick(8);
+}
+
 function renderMessages(messages){
   const thread=document.getElementById('thread');
   thread.innerHTML='';
   if(!messages.length){thread.innerHTML=EMPTY_STATE_HTML;return;}
   messages.forEach(m=>{
     const n=parseInt(m.id.replace('m',''),10);if(n>=msgCount)msgCount=n;
-    const row=document.createElement('div');row.className='row '+m.role;row.id=m.id;
-    const bub=document.createElement('div');bub.className='bubble';bub.innerHTML=m.inner;
-    row.appendChild(bub);thread.appendChild(row);
+    renderRowEl(m);
     chatLog.push(m);
   });
   thread.scrollTop=thread.scrollHeight;
@@ -890,8 +1008,34 @@ function timeAgo(ts){
   return new Date(ts).toLocaleDateString();
 }
 
+function exportSession(id,evt){
+  if(evt)evt.stopPropagation();
+  const session=loadSessions().find(s=>s.id===id);
+  if(!session)return;
+  let md='# '+session.title+'\n\n';
+  session.messages.forEach(m=>{
+    md+=(m.role==='user'?'**You:** ':'**Nexus:** ')+stripHtml(m.inner)+'\n\n';
+  });
+  const blob=new Blob([md],{type:'text/markdown'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;a.download=(session.title||'chat').replace(/[^\w\-]+/g,'_').slice(0,40)+'.md';
+  document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),2000);
+  tick(8);
+}
+
+let historyTab='all';
+function switchHistoryTab(tab){
+  historyTab=tab;
+  document.getElementById('tabAll').classList.toggle('active',tab==='all');
+  document.getElementById('tabPinned').classList.toggle('active',tab==='pinned');
+  renderHistoryList();
+}
+
 function renderHistoryList(){
   const list=document.getElementById('historyList');
+  if(historyTab==='pinned'){renderPinnedList(list);return;}
   const sessions=loadSessions().filter(s=>s.messages&&s.messages.length).sort((a,b)=>b.updatedAt-a.updatedAt);
   if(!sessions.length){
     list.innerHTML='<div class="history-empty">No saved chats yet. Start talking to Nexus and it\'ll show up here.</div>';
@@ -904,13 +1048,39 @@ function renderHistoryList(){
         '<div class="history-item-title">'+esc(s.title)+'</div>'+
         '<div class="history-item-meta">'+timeAgo(s.updatedAt)+' &middot; '+count+' message'+(count===1?'':'s')+'</div>'+
       '</div>'+
+      '<button class="history-item-export" onclick="exportSession(\''+s.id+'\',event)" aria-label="Export chat">&#8681;</button>'+
       '<button class="history-item-del" onclick="deleteSession(\''+s.id+'\',event)" aria-label="Delete chat">&#128465;</button>'+
+    '</div>';
+  }).join('');
+}
+
+function renderPinnedList(list){
+  const pins=[];
+  loadSessions().forEach(s=>{
+    (s.messages||[]).forEach(m=>{
+      if(m.pinned)pins.push({sessionId:s.id,sessionTitle:s.title,role:m.role,text:stripHtml(m.inner)});
+    });
+  });
+  if(!pins.length){
+    list.innerHTML='<div class="history-empty">No pinned messages yet. Tap the pin icon on any message to save it here.</div>';
+    return;
+  }
+  list.innerHTML=pins.map(p=>{
+    const snippet=p.text.length>80?p.text.slice(0,80)+'…':p.text;
+    return '<div class="history-item" onclick="openSession(\''+p.sessionId+'\')">'+
+      '<div class="history-item-body">'+
+        '<div class="pin-item-role">'+(p.role==='user'?'You':'Nexus')+' &middot; '+esc(p.sessionTitle)+'</div>'+
+        '<div class="history-item-title">'+esc(snippet)+'</div>'+
+      '</div>'+
     '</div>';
   }).join('');
 }
 
 function openHistory(){
   saveChatLog(); // make sure the in-progress chat shows up if it already has messages
+  historyTab='all';
+  document.getElementById('tabAll').classList.add('active');
+  document.getElementById('tabPinned').classList.remove('active');
   renderHistoryList();
   document.getElementById('historyScreen').classList.add('visible');
   tick(10);
@@ -919,35 +1089,157 @@ function closeHistory(){document.getElementById('historyScreen').classList.remov
 
 function addRow(role,inner){
   const es=document.getElementById('emptyState');if(es)es.remove();
-  const thread=document.getElementById('thread');
   const id='m'+(++msgCount);
-  const row=document.createElement('div');row.className='row '+role;row.id=id;
-  const bub=document.createElement('div');bub.className='bubble';bub.innerHTML=inner;
-  row.appendChild(bub);thread.appendChild(row);thread.scrollTop=thread.scrollHeight;
-  chatLog.push({id,role,inner});saveChatLog();
+  const m={id,role,inner,pinned:false};
+  renderRowEl(m);
+  document.getElementById('thread').scrollTop=document.getElementById('thread').scrollHeight;
+  chatLog.push(m);saveChatLog();
   return id;
 }
 function setRow(id,inner){
-  const row=document.getElementById(id);if(row)row.querySelector('.bubble').innerHTML=inner;
+  const row=document.getElementById(id);
+  if(row){const c=row.querySelector('.bubble-content');if(c)c.innerHTML=inner;}
   document.getElementById('thread').scrollTop=99999;
   const entry=chatLog.find(m=>m.id===id);if(entry){entry.inner=inner;saveChatLog();}
 }
 function typingRow(){return addRow('bot','<div class="typing"><span></span><span></span><span></span></div>');}
 
+// reveals AI text progressively (plain text) then swaps in the fully
+// formatted markdown once done, so it feels like it's "typing" without
+// waiting ages on long responses.
+function typeIntoRow(id,text,onDone){
+  const row=document.getElementById(id);
+  const el=row&&row.querySelector('.bubble-content');
+  if(!el){onDone&&onDone();return;}
+  el.textContent='';
+  const total=text.length;
+  const steps=Math.min(60,Math.max(20,Math.ceil(total/4)));
+  const chunk=Math.max(1,Math.ceil(total/steps));
+  let i=0;
+  function step(){
+    i=Math.min(total,i+chunk);
+    el.textContent=text.slice(0,i);
+    document.getElementById('thread').scrollTop=99999;
+    if(i<total)setTimeout(step,16);
+    else onDone&&onDone();
+  }
+  step();
+}
+
+function followupChipsHtml(){
+  return '<div class="followups">'+
+    '<div class="followup-chip" onclick="respond(\'Can you explain that more simply?\')">Explain simpler</div>'+
+    '<div class="followup-chip" onclick="respond(\'Can you give me an example?\')">Give an example</div>'+
+    '<div class="followup-chip" onclick="respond(\'Tell me more about that.\')">Tell me more</div>'+
+  '</div>';
+}
+
+// ── MEMORY (persists across every chat, not just the current session) ────────
+const MEMORY_KEY='nexus_memory_facts';
+function loadMemoryFacts(){try{return JSON.parse(localStorage.getItem(MEMORY_KEY)||'[]');}catch(e){return [];}}
+function saveMemoryFacts(facts){try{localStorage.setItem(MEMORY_KEY,JSON.stringify(facts));}catch(e){}}
+function addMemoryFact(fact){const facts=loadMemoryFacts();facts.push({text:fact,addedAt:Date.now()});saveMemoryFacts(facts);}
+
+// ── WEATHER (OpenWeatherMap via /api/weather — needs OPENWEATHER_API_KEY set in Vercel) ──
+const WEATHER_PROXY_URL='/api/weather';
+function weatherEmoji(id){
+  if(id>=200&&id<300)return '⛈️';
+  if(id>=300&&id<600)return id<500?'🌦️':'🌧️';
+  if(id>=600&&id<700)return '❄️';
+  if(id>=700&&id<800)return '🌫️';
+  if(id===800)return '☀️';
+  if(id>800)return '☁️';
+  return '🌡️';
+}
+function renderWeather(url,fallbackName,rowId){
+  fetch(url).then(r=>r.json()).then(data=>{
+    if(!data||!data.main){
+      setRow(rowId,(data&&data.message?esc(data.message):"Couldn't find weather for that location.")+'<span class="tag err">Error</span>');
+      return;
+    }
+    const temp=Math.round(data.main.temp),feels=Math.round(data.main.feels_like);
+    const w=data.weather&&data.weather[0]||{};
+    const emoji=weatherEmoji(w.id||0);
+    const name=data.name||fallbackName||'your location';
+    setRow(rowId,
+      '<div class="ai-body"><p style="font-size:28px;margin:0 0 4px">'+emoji+' <strong>'+temp+'°C</strong></p>'+
+      '<p>'+esc(name)+' &middot; '+esc(w.description||'')+'<br>Feels like '+feels+'°C &middot; Humidity '+data.main.humidity+'% &middot; Wind '+Math.round(data.wind?.speed||0)+' m/s</p></div>'+
+      '<span class="tag green">Weather</span>'
+    );
+  }).catch(()=>setRow(rowId,"Couldn't reach the weather service.<span class=\"tag err\">Error</span>"));
+}
+function getWeather(place,rowId){
+  if(place){
+    renderWeather(WEATHER_PROXY_URL+'?city='+encodeURIComponent(place),place,rowId);
+  }else if(typeof userLat!=='undefined'&&userLat&&userLon){
+    renderWeather(WEATHER_PROXY_URL+'?lat='+userLat+'&lon='+userLon,null,rowId);
+  }else if(navigator.geolocation){
+    navigator.geolocation.getCurrentPosition(pos=>{
+      userLat=pos.coords.latitude;userLon=pos.coords.longitude;
+      renderWeather(WEATHER_PROXY_URL+'?lat='+userLat+'&lon='+userLon,null,rowId);
+    },()=>setRow(rowId,'I need location access for local weather — or ask "weather in [city]".<span class="tag err">Error</span>'));
+  }else{
+    setRow(rowId,'Try asking "weather in [city]".<span class="tag">Weather</span>');
+  }
+}
+
+// ── IMAGE GENERATION (Gemini/Imagen via /api/image — needs GEMINI_API_KEY set in Vercel) ──
+const IMAGE_PROXY_URL='/api/image';
+async function generateImage(prompt,rowId){
+  try{
+    const res=await fetch(IMAGE_PROXY_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});
+    const data=await res.json();
+    const parts=data?.candidates?.[0]?.content?.parts||[];
+    const imgPart=parts.find(p=>p.inlineData||p.inline_data);
+    const inline=imgPart&&(imgPart.inlineData||imgPart.inline_data);
+    if(!inline){
+      setRow(rowId,"Couldn't generate that image — try a different prompt.<span class=\"tag err\">Error</span>");
+      return;
+    }
+    const mime=inline.mimeType||inline.mime_type||'image/png';
+    const src='data:'+mime+';base64,'+inline.data;
+    const dlId=rowId+'_dl';
+    setRow(rowId,
+      '<img src="'+src+'" style="width:100%;border-radius:12px;display:block;margin-top:4px" alt="'+esc(prompt)+'">'+
+      '<button class="action-btn" id="'+dlId+'">Download</button>'+
+      '<span class="tag green">Image</span>'
+    );
+    const btn=document.getElementById(dlId);
+    if(btn)btn.onclick=function(){
+      const a=document.createElement('a');
+      a.href=src;a.download=prompt.replace(/[^\w\-]+/g,'_').slice(0,40)+'.png';
+      document.body.appendChild(a);a.click();a.remove();
+    };
+  }catch(e){
+    setRow(rowId,"Couldn't reach the image service.<span class=\"tag err\">Error</span>");
+  }
+}
+
 // ── GEMINI AI ────────────────────────────────────────────────────────────────
 let conversationHistory=[];
 const SYSTEM_PROMPT='You are Nexus, a smart personal AI assistant running on Android. Answer clearly and concisely. Use markdown: **bold** for key terms, bullet lists where helpful, numbered steps, code blocks where needed. For homework always show working. Remember everything the user has told you in this conversation. You can help with anything: questions, writing, coding, maths, advice, and more.';
+function buildSystemPrompt(){
+  const now=new Date();
+  const dateStr=now.toLocaleDateString([],{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  const timeStr=now.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
+  let prompt=SYSTEM_PROMPT+' Today\'s real date is '+dateStr+', and the current local time is '+timeStr+' — always use this as the true current date/time, not any date you might otherwise assume.';
+  const facts=loadMemoryFacts();
+  if(facts.length)prompt+=' The user has asked you to remember these facts about them — they apply across every conversation, not just this one: '+facts.map(f=>f.text).join('; ')+'.';
+  return prompt;
+}
 
 async function handleAI(question,label,rowId){
   conversationHistory.push({role:'user',parts:[{text:question}]});
   try{
-    const body={system_instruction:{parts:[{text:SYSTEM_PROMPT}]},contents:conversationHistory};
+    const body={system_instruction:{parts:[{text:buildSystemPrompt()}]},contents:conversationHistory};
     const res=await fetch(GEMINI_PROXY_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const data=await res.json();
     const text=data?.candidates?.[0]?.content?.parts?.[0]?.text||"Sorry, couldn't get a response.";
     conversationHistory.push({role:'model',parts:[{text:text}]});
-    setRow(rowId,'<div class="ai-body">'+mdToHtml(text)+'</div><span class="tag">'+label+'</span>');
-    speak(text);
+    typeIntoRow(rowId,text,()=>{
+      setRow(rowId,'<div class="ai-body">'+mdToHtml(text)+'</div><span class="tag">'+label+'</span>'+followupChipsHtml());
+      speak(text);
+    });
   }catch(e){
     conversationHistory.pop();
     setRow(rowId,"Couldn't reach AI &mdash; check your connection.<br><span class=\"tag err\">Error</span>");
@@ -1001,6 +1293,33 @@ async function respond(raw){
       break;
     case 'alarm':
       setAlarm(intent.time, tid);
+      break;
+    case 'reminder':
+      setReminder(intent.note, intent.when, tid);
+      break;
+    case 'remember':
+      addMemoryFact(intent.fact);
+      setRow(tid,'Got it — I\'ll remember that <strong>'+esc(intent.fact)+'</strong>. This carries into future chats too.<span class="tag green">Memory</span>');
+      break;
+    case 'forget':{
+      const facts=loadMemoryFacts();
+      const needle=intent.fact.toLowerCase();
+      const filtered=facts.filter(f=>!f.text.toLowerCase().includes(needle)&&!needle.includes(f.text.toLowerCase()));
+      saveMemoryFacts(filtered);
+      setRow(tid, filtered.length<facts.length ? 'Forgot that.<span class="tag green">Memory</span>' : "I couldn't find that in what I remember.<span class=\"tag\">Memory</span>");
+      break;}
+    case 'recall_memory':{
+      const facts=loadMemoryFacts();
+      if(!facts.length){setRow(tid,'I don\'t have anything saved about you yet. Try "remember I\'m vegetarian".<span class="tag">Memory</span>');}
+      else{setRow(tid,'<div class="ai-body">Here\'s what I remember about you:<ul>'+facts.map(f=>'<li>'+esc(f.text)+'</li>').join('')+'</ul></div><span class="tag">Memory</span>');}
+      break;}
+    case 'weather':
+      setRow(tid,'Checking the weather...');
+      getWeather(intent.place, tid);
+      break;
+    case 'image_gen':
+      setRow(tid,'Generating your image...');
+      generateImage(intent.prompt, tid);
       break;
     case 'location':
       setRow(tid,'Getting your location...');
